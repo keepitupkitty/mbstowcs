@@ -7,7 +7,10 @@
 )]
 #![feature(once_cell_get_mut)]
 
-use std::{ffi::c_char, str};
+use {
+  critical_section::Mutex,
+  std::{cell::UnsafeCell, ffi::c_char, str}
+};
 
 pub type char8_t = u8;
 pub type char16_t = u16;
@@ -20,16 +23,26 @@ pub type ssize_t = isize;
 struct MBState {
   count: usize,
   u8_buffer: [char8_t; 4],
-  u8_position: usize
+  u8_position: usize,
+  u16_buffer: [char16_t; 2],
+  u16_surrogate: char16_t
 }
 
 impl MBState {
   pub const fn new() -> Self {
-    Self { count: 0, u8_buffer: [0; 4], u8_position: 0 }
+    Self {
+      count: 0,
+      u8_buffer: [0; 4],
+      u8_position: 0,
+      u16_buffer: [0; 2],
+      u16_surrogate: 0
+    }
   }
 
   pub fn is_initial(&self) -> bool {
-    self.count == 0 && self.u8_position == 0
+    self.count == 0 &&
+      self.u8_position == 0 &&
+      (self.u16_surrogate < 0xd800 || self.u16_surrogate > 0xdfff)
   }
 
   pub fn reset(&mut self) {
@@ -49,11 +62,15 @@ pub extern "C" fn rs_c8rtomb(
   c8: char8_t,
   ps: *mut mbstate_t
 ) -> size_t {
-  static mut GLOBAL: MBState = MBState::new();
+  static GLOBAL: Mutex<UnsafeCell<MBState>> =
+    Mutex::new(UnsafeCell::new(MBState::new()));
   let ps: &mut MBState = if !ps.is_null() {
     unsafe { &mut *ps }
   } else {
-    unsafe { &mut *&raw mut GLOBAL }
+    critical_section::with(|cs| {
+      let cell = GLOBAL.borrow(cs);
+      unsafe { &mut *cell.get() }
+    })
   };
 
   let mut buf: [c_char; MB_LEN_MAX as usize] = [0; MB_LEN_MAX as usize];
@@ -122,16 +139,82 @@ pub extern "C" fn rs_c8rtomb(
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn rs_c16rtomb(
+  s: *mut c_char,
+  c16: char16_t,
+  ps: *mut mbstate_t
+) -> size_t {
+  static GLOBAL: Mutex<UnsafeCell<MBState>> =
+    Mutex::new(UnsafeCell::new(MBState::new()));
+  let ps: &mut MBState = if !ps.is_null() {
+    unsafe { &mut *ps }
+  } else {
+    critical_section::with(|cs| {
+      let cell = GLOBAL.borrow(cs);
+      unsafe { &mut *cell.get() }
+    })
+  };
+
+  let mut buf: [c_char; MB_LEN_MAX as usize] = [0; MB_LEN_MAX as usize];
+  let (s, c16) = if s.is_null() { (buf.as_mut_ptr(), 0) } else { (s, c16) };
+
+  if !ps.is_initial() {
+    let units = [ps.u16_surrogate, c16];
+    let mut decoder = char::decode_utf16(units.iter().copied());
+
+    match decoder.next() {
+      | Some(Ok(c)) => {
+        if decoder.next().is_some() {
+          return -1isize as size_t;
+        }
+        ps.reset();
+        c32tomb(s, c as char32_t, ps) as size_t
+      },
+      | _ => -1isize as size_t
+    }
+  } else {
+    let units = [c16];
+    let mut decoder = char::decode_utf16(units.iter().copied());
+
+    if let Some(next) = decoder.next() {
+      match next {
+        | Ok(c) => {
+          ps.reset();
+          c32tomb(s, c as char32_t, ps) as size_t
+        },
+        | Err(e) => {
+          if (0xD800..=0xDBFF).contains(&e.unpaired_surrogate()) {
+            ps.u16_surrogate = e.unpaired_surrogate();
+            return 0;
+          }
+          {
+            // EILSEQ
+            -1isize as size_t
+          }
+        }
+      }
+    } else {
+      // EILSEQ
+      -1isize as size_t
+    }
+  }
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn rs_c32rtomb(
   s: *mut c_char,
   c32: char32_t,
   ps: *mut mbstate_t
 ) -> size_t {
-  static mut GLOBAL: MBState = MBState::new();
+  static GLOBAL: Mutex<UnsafeCell<MBState>> =
+    Mutex::new(UnsafeCell::new(MBState::new()));
   let ps: &mut MBState = if !ps.is_null() {
     unsafe { &mut *ps }
   } else {
-    unsafe { &mut *&raw mut GLOBAL }
+    critical_section::with(|cs| {
+      let cell = GLOBAL.borrow(cs);
+      unsafe { &mut *cell.get() }
+    })
   };
 
   let mut buf: [c_char; MB_LEN_MAX as usize] = [0; MB_LEN_MAX as usize];
@@ -148,11 +231,15 @@ pub extern "C" fn rs_mbrtoc32(
   n: size_t,
   ps: *mut mbstate_t
 ) -> size_t {
-  static mut GLOBAL: MBState = MBState::new();
+  static GLOBAL: Mutex<UnsafeCell<MBState>> =
+    Mutex::new(UnsafeCell::new(MBState::new()));
   let ps: &mut MBState = if !ps.is_null() {
     unsafe { &mut *ps }
   } else {
-    unsafe { &mut *&raw mut GLOBAL }
+    critical_section::with(|cs| {
+      let cell = GLOBAL.borrow(cs);
+      unsafe { &mut *cell.get() }
+    })
   };
 
   let (pc32, s, n) = if s.is_null() {
