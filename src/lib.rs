@@ -49,6 +49,8 @@ impl MBState {
     self.count = 0;
     self.u8_buffer = [0; 4];
     self.u8_position = 0;
+    self.u16_buffer = [0; 2];
+    self.u16_surrogate = 0;
   }
 }
 
