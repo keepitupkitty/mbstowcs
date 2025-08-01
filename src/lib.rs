@@ -191,7 +191,7 @@ pub extern "C" fn rs_c16rtomb(
           return c32tomb(s, c as char32_t) as size_t;
         },
         | Err(e) => {
-          if (0xD800..=0xDBFF).contains(&e.unpaired_surrogate()) {
+          if (0xd800..=0xdbff).contains(&e.unpaired_surrogate()) {
             ps.u16_surrogate = e.unpaired_surrogate();
             return 0;
           }
@@ -335,12 +335,56 @@ pub extern "C" fn rs_mbrtoc16(
     unsafe { (&mut *pc16, core::slice::from_raw_parts(s as *const u8, n)) }
   };
 
+  if ps.u16_surrogate != 0 {
+    if !rc16.is_null() {
+      *pc16 = ps.u16_surrogate;
+    }
+    ps.u16_surrogate = 0;
+    return -3isize as size_t;
+  }
+
   let mut c32: char32_t = 0;
   let l: ssize_t = mbtoc32(&mut c32, buffer, ps);
   if l >= 0 {
-    // Logic
+    match l {
+      | 0 => {
+        if !rc16.is_null() {
+          *pc16 = 0;
+        }
+        return 0;
+      },
+      | -1 | -2 => return l as size_t,
+      | _ => {}
+    }
 
-    if *pc16 == '\0' as u16 {
+    let decoded = match char::from_u32(c32) {
+      | Some(d) => d,
+      | None => {
+        //errno::set_errno(errno::EILSEQ);
+        return -1isize as usize;
+      }
+    };
+
+    let mut buffer = [0u16; 16];
+    let result = decoded.encode_utf16(&mut buffer);
+
+    ps.u16_buffer[..result.len()].copy_from_slice(result);
+
+    if result.len() == 2 {
+      let leading = ps.u16_buffer[0];
+      let trailing = ps.u16_buffer[1];
+
+      ps.u16_surrogate = trailing;
+      if !rc16.is_null() {
+        *pc16 = leading;
+      }
+    } else {
+      if !rc16.is_null() {
+        *pc16 = ps.u16_buffer[0];
+      }
+    }
+
+    if *pc16 == '\0' as char16_t {
       return 0;
     }
   }
