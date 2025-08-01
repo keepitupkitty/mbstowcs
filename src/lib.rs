@@ -22,6 +22,7 @@ pub type ssize_t = isize;
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct MBState {
+  ch: char32_t,
   bytesleft: usize,
   partial: char32_t,
   lowerbound: char32_t,
@@ -34,6 +35,7 @@ struct MBState {
 impl MBState {
   pub const fn new() -> Self {
     Self {
+      ch: 0,
       bytesleft: 0,
       partial: 0,
       lowerbound: 0,
@@ -45,11 +47,13 @@ impl MBState {
   }
 
   pub fn is_initial(&self) -> bool {
-    self.bytesleft == 0 &&
+    self.ch == 0 &&
+      self.bytesleft == 0 &&
       (self.u16_surrogate < 0xd800 || self.u16_surrogate > 0xdfff)
   }
 
   pub fn reset(&mut self) {
+    self.ch = 0;
     self.bytesleft = 0;
     self.partial = 0;
     self.lowerbound = 0;
