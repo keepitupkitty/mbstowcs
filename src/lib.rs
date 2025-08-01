@@ -12,6 +12,7 @@ use {
   std::{cell::UnsafeCell, ffi::c_char, str}
 };
 
+pub type c_int = i32;
 pub type char8_t = u8;
 pub type char16_t = u16;
 pub type char32_t = u32;
@@ -21,7 +22,9 @@ pub type ssize_t = isize;
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct MBState {
-  count: usize,
+  bytesleft: usize,
+  partial: char32_t,
+  lowerbound: char32_t,
   u8_buffer: [char8_t; 4],
   u8_position: usize,
   u16_buffer: [char16_t; 2],
@@ -31,7 +34,9 @@ struct MBState {
 impl MBState {
   pub const fn new() -> Self {
     Self {
-      count: 0,
+      bytesleft: 0,
+      partial: 0,
+      lowerbound: 0,
       u8_buffer: [0; 4],
       u8_position: 0,
       u16_buffer: [0; 2],
@@ -40,13 +45,15 @@ impl MBState {
   }
 
   pub fn is_initial(&self) -> bool {
-    self.count == 0 &&
+    self.bytesleft == 0 &&
       self.u8_position == 0 &&
       (self.u16_surrogate < 0xd800 || self.u16_surrogate > 0xdfff)
   }
 
   pub fn reset(&mut self) {
-    self.count = 0;
+    self.bytesleft = 0;
+    self.partial = 0;
+    self.lowerbound = 0;
     self.u8_buffer = [0; 4];
     self.u8_position = 0;
     self.u16_buffer = [0; 2];
@@ -80,7 +87,7 @@ pub extern "C" fn rs_c8rtomb(
 
   if ps.u8_position == 0 {
     if (c8 >= 0x80 && c8 <= 0xc1) || c8 >= 0xf5 {
-      // EILSEQ
+      //errno::set_errno(errno::EILSEQ);
       return -1isize as size_t;
     }
     if c8 >= 0xc2 {
@@ -99,7 +106,7 @@ pub extern "C" fn rs_c8rtomb(
         (ps.u8_buffer[0] == 0xf0 && c8 < 0x90) ||
         (ps.u8_buffer[0] == 0xf4 && c8 > 0xbf)
       {
-        // EILSEQ
+        //errno::set_errno(errno::EILSEQ);
         return -1isize as size_t;
       }
 
@@ -110,7 +117,7 @@ pub extern "C" fn rs_c8rtomb(
       }
     } else {
       if c8 < 0x80 || c8 > 0xbf {
-        // EILSEQ
+        //errno::set_errno(errno::EILSEQ);
         return -1isize as size_t;
       }
 
@@ -133,7 +140,7 @@ pub extern "C" fn rs_c8rtomb(
         decoded.len()
       },
       | Err(_) => {
-        // EILSEQ
+        //errno::set_errno(errno::EILSEQ);
         -1isize as size_t
       }
     }
@@ -187,13 +194,13 @@ pub extern "C" fn rs_c16rtomb(
             return 0;
           }
           {
-            // EILSEQ
+            //errno::set_errno(errno::EILSEQ);
             -1isize as size_t
           }
         }
       }
     } else {
-      // EILSEQ
+      //errno::set_errno(errno::EILSEQ);
       -1isize as size_t
     }
   }
@@ -241,17 +248,29 @@ pub extern "C" fn rs_mbrtoc32(
     })
   };
 
-  let (mut pc32, buffer) = if s.is_null() {
-    (0, [0u8; 1].as_slice())
+  let (pc32, buffer): (&mut char32_t, &[u8]) = if s.is_null() {
+    unsafe { (&mut *pc32, [0u8; 1].as_slice()) }
+  } else if pc32.is_null() {
+    unsafe { (&mut 0, core::slice::from_raw_parts(s as *const u8, n)) }
   } else {
-    unsafe { (*pc32, core::slice::from_raw_parts(s as *const u8, n)) }
+    unsafe { (&mut *pc32, core::slice::from_raw_parts(s as *const u8, n)) }
   };
 
-  let l: ssize_t = mbtoc32(&mut pc32, buffer, ps);
-  if l >= 0 && pc32 == '\0' as char32_t {
+  let l: ssize_t = mbtoc32(pc32, buffer, ps);
+  if l >= 0 && *pc32 == '\0' as char32_t {
     return 0;
   }
   l as size_t
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rs_mbsinit(ps: *const mbstate_t) -> c_int {
+  if ps.is_null() {
+    c_int::from(true)
+  } else {
+    let ps = unsafe { *ps as MBState };
+    c_int::from(ps.is_initial())
+  }
 }
 
 // BOILERPLATE
@@ -297,9 +316,80 @@ fn c32tomb(
 }
 
 fn mbtoc32(
-  _pc32: &mut char32_t,
-  _s: &[u8],
-  _ps: &mut MBState
+  pc32: &mut char32_t,
+  s: &[u8],
+  ps: &mut MBState
 ) -> ssize_t {
-  todo!()
+  let mut n = s.len();
+  let mut offset = 0;
+
+  if n < 1 {
+    return -2;
+  }
+
+  let mut bytesleft = ps.bytesleft;
+  let mut partial = ps.partial;
+  let mut lowerbound = ps.lowerbound;
+
+  if bytesleft == 0 {
+    if (s[offset] & 0x80) == 0 {
+      *pc32 = s[offset] as char32_t;
+      ps.reset();
+      return 1;
+    } else if (s[offset] & 0xe0) == 0xc0 {
+      bytesleft = 1;
+      partial = s[offset] as char32_t & 0x1f;
+      lowerbound = 0x80;
+      offset += 1;
+    } else if (s[offset] & 0xf0) == 0xe0 {
+      bytesleft = 2;
+      partial = s[offset] as char32_t & 0xf;
+      lowerbound = 0x800;
+      offset += 1;
+    } else if (s[offset] & 0xf8) == 0xf0 {
+      bytesleft = 3;
+      partial = s[offset] as char32_t & 0x7;
+      lowerbound = 0x10000;
+      offset += 1;
+    } else {
+      //errno::set_errno(errno::EILSEQ);
+      return -1;
+    }
+
+    n -= 1;
+  }
+
+  while n > 0 {
+    if (s[offset] & 0xc0) != 0x80 {
+      //errno::set_errno(errno::EILSEQ);
+      return -1;
+    }
+
+    partial <<= 6;
+    partial |= s[offset] as char32_t & 0x3f;
+    offset += 1;
+    bytesleft -= 1;
+
+    if bytesleft == 0 {
+      if partial < lowerbound ||
+        (partial >= 0xd800 && partial <= 0xdfff) ||
+        partial > 0x10ffff
+      {
+        //errno::set_errno(errno::EILSEQ);
+        return -1;
+      }
+
+      *pc32 = partial;
+      ps.reset();
+      return offset as ssize_t;
+    }
+
+    n -= 1;
+  }
+
+  ps.bytesleft = bytesleft;
+  ps.lowerbound = lowerbound;
+  ps.partial = partial;
+
+  -2
 }
