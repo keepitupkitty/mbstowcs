@@ -46,7 +46,6 @@ impl MBState {
 
   pub fn is_initial(&self) -> bool {
     self.bytesleft == 0 &&
-      self.u8_position == 0 &&
       (self.u16_surrogate < 0xd800 || self.u16_surrogate > 0xdfff)
   }
 
@@ -167,16 +166,19 @@ pub extern "C" fn rs_c16rtomb(
   let mut buf: [c_char; MB_LEN_MAX as usize] = [0; MB_LEN_MAX as usize];
   let (s, c16) = if s.is_null() { (buf.as_mut_ptr(), 0) } else { (s, c16) };
 
-  if !ps.is_initial() {
+  if ps.u16_surrogate != 0 {
     let units = [ps.u16_surrogate, c16];
     let mut decoder = char::decode_utf16(units.iter().copied());
 
     match decoder.next() {
       | Some(Ok(c)) => {
         ps.reset();
-        c32tomb(s, c as char32_t) as size_t
+        return c32tomb(s, c as char32_t) as size_t;
       },
-      | _ => -1isize as size_t
+      | _ => {
+        //errno::set_errno(errno::EILSEQ);
+        return -1isize as size_t;
+      }
     }
   } else {
     let units = [c16];
@@ -186,24 +188,20 @@ pub extern "C" fn rs_c16rtomb(
       match next {
         | Ok(c) => {
           ps.reset();
-          c32tomb(s, c as char32_t) as size_t
+          return c32tomb(s, c as char32_t) as size_t;
         },
         | Err(e) => {
           if (0xD800..=0xDBFF).contains(&e.unpaired_surrogate()) {
             ps.u16_surrogate = e.unpaired_surrogate();
             return 0;
           }
-          {
-            //errno::set_errno(errno::EILSEQ);
-            -1isize as size_t
-          }
-        }
+        },
       }
-    } else {
-      //errno::set_errno(errno::EILSEQ);
-      -1isize as size_t
     }
   }
+
+  //errno::set_errno(errno::EILSEQ);
+  -1isize as size_t
 }
 
 #[unsafe(no_mangle)]
@@ -231,6 +229,126 @@ pub extern "C" fn rs_c32rtomb(
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn rs_mbrtoc8(
+  pc8: *mut char8_t,
+  s: *const c_char,
+  n: size_t,
+  ps: *mut mbstate_t
+) -> size_t {
+  static GLOBAL: Mutex<UnsafeCell<MBState>> =
+    Mutex::new(UnsafeCell::new(MBState::new()));
+  let ps: &mut MBState = if !ps.is_null() {
+    unsafe { &mut *ps }
+  } else {
+    critical_section::with(|cs| {
+      let cell = GLOBAL.borrow(cs);
+      unsafe { &mut *cell.get() }
+    })
+  };
+
+  let rc8 = pc8;
+  let mut c8: char8_t = 0;
+  let (pc8, buffer): (&mut char8_t, &[u8]) = if s.is_null() {
+    unsafe { (&mut *pc8, [0u8; 1].as_slice()) }
+  } else if pc8.is_null() {
+    unsafe { (&mut c8, core::slice::from_raw_parts(s as *const u8, n)) }
+  } else {
+    unsafe { (&mut *pc8, core::slice::from_raw_parts(s as *const u8, n)) }
+  };
+
+  if ps.u8_position != 0 {
+    if !rc8.is_null() {
+      let total = ps.u8_buffer.iter().position(|&b| b == 0).unwrap_or(4);
+      let index = total - ps.u8_position;
+
+      *pc8 = ps.u8_buffer[index];
+    }
+    ps.u8_position -= 1;
+    return -3isize as usize;
+  }
+
+  let mut c32: char32_t = 0;
+  let l: ssize_t = mbtoc32(&mut c32, buffer, ps);
+  if l >= 0 {
+    match l {
+      | 0 => {
+        if !rc8.is_null() {
+          *pc8 = 0;
+        }
+        return 0;
+      },
+      | -1 | -2 => return l as size_t,
+      | _ => {}
+    }
+
+    let decoded = match char::from_u32(c32) {
+      | Some(d) => d,
+      | None => {
+        //errno::set_errno(errno::EILSEQ);
+        return -1isize as usize;
+      }
+    };
+
+    let mut buffer = [0u8; 4];
+    let result = decoded.encode_utf8(&mut buffer).as_bytes();
+
+    ps.u8_buffer[..result.len()].copy_from_slice(result);
+    ps.u8_position = result.len() - 1;
+
+    if !rc8.is_null() {
+      *pc8 = ps.u8_buffer[0];
+    }
+
+    if *pc8 == b'\0' {
+      return 0;
+    }
+  }
+
+  l as size_t
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rs_mbrtoc16(
+  pc16: *mut char16_t,
+  s: *const c_char,
+  n: size_t,
+  ps: *mut mbstate_t
+) -> size_t {
+  static GLOBAL: Mutex<UnsafeCell<MBState>> =
+    Mutex::new(UnsafeCell::new(MBState::new()));
+  let ps: &mut MBState = if !ps.is_null() {
+    unsafe { &mut *ps }
+  } else {
+    critical_section::with(|cs| {
+      let cell = GLOBAL.borrow(cs);
+      unsafe { &mut *cell.get() }
+    })
+  };
+
+  let rc16 = pc16;
+  let mut c16: char16_t = 0;
+  let (pc16, buffer): (&mut char16_t, &[u8]) = if s.is_null() {
+    unsafe { (&mut *pc16, [0u8; 1].as_slice()) }
+  } else if pc16.is_null() {
+    unsafe { (&mut c16, core::slice::from_raw_parts(s as *const u8, n)) }
+  } else {
+    unsafe { (&mut *pc16, core::slice::from_raw_parts(s as *const u8, n)) }
+  };
+
+  let mut c32: char32_t = 0;
+  let l: ssize_t = mbtoc32(&mut c32, buffer, ps);
+  if l >= 0 {
+    // Logic
+
+    if *pc16 == '\0' as u16 {
+      return 0;
+    }
+  }
+
+  l as size_t
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn rs_mbrtoc32(
   pc32: *mut char32_t,
   s: *const c_char,
@@ -248,10 +366,11 @@ pub extern "C" fn rs_mbrtoc32(
     })
   };
 
+  let mut c32: char32_t = 0;
   let (pc32, buffer): (&mut char32_t, &[u8]) = if s.is_null() {
     unsafe { (&mut *pc32, [0u8; 1].as_slice()) }
   } else if pc32.is_null() {
-    unsafe { (&mut 0, core::slice::from_raw_parts(s as *const u8, n)) }
+    unsafe { (&mut c32, core::slice::from_raw_parts(s as *const u8, n)) }
   } else {
     unsafe { (&mut *pc32, core::slice::from_raw_parts(s as *const u8, n)) }
   };
