@@ -90,7 +90,7 @@ pub extern "C" fn rs_c8rtomb(
     }
 
     ps.reset();
-    c32tomb(s, c8 as char32_t, ps) as size_t
+    c32tomb(s, c8 as char32_t) as size_t
   } else {
     if ps.u8_position == 1 {
       if (c8 < 0x80 || c8 > 0xbf) ||
@@ -128,7 +128,7 @@ pub extern "C" fn rs_c8rtomb(
       | Ok(decoded) => {
         if let Some(c32) = decoded.chars().next() {
           ps.reset();
-          return c32tomb(s, c32 as char32_t, ps) as size_t;
+          return c32tomb(s, c32 as char32_t) as size_t;
         }
         decoded.len()
       },
@@ -166,11 +166,8 @@ pub extern "C" fn rs_c16rtomb(
 
     match decoder.next() {
       | Some(Ok(c)) => {
-        if decoder.next().is_some() {
-          return -1isize as size_t;
-        }
         ps.reset();
-        c32tomb(s, c as char32_t, ps) as size_t
+        c32tomb(s, c as char32_t) as size_t
       },
       | _ => -1isize as size_t
     }
@@ -182,7 +179,7 @@ pub extern "C" fn rs_c16rtomb(
       match next {
         | Ok(c) => {
           ps.reset();
-          c32tomb(s, c as char32_t, ps) as size_t
+          c32tomb(s, c as char32_t) as size_t
         },
         | Err(e) => {
           if (0xD800..=0xDBFF).contains(&e.unpaired_surrogate()) {
@@ -223,7 +220,7 @@ pub extern "C" fn rs_c32rtomb(
   let (s, c32) = if s.is_null() { (buf.as_mut_ptr(), 0) } else { (s, c32) };
 
   ps.reset();
-  c32tomb(s, c32, ps) as size_t
+  c32tomb(s, c32) as size_t
 }
 
 #[unsafe(no_mangle)]
@@ -244,14 +241,14 @@ pub extern "C" fn rs_mbrtoc32(
     })
   };
 
-  let (pc32, s, n) = if s.is_null() {
-    (0 as *mut char32_t, 0 as *const c_char, 1 as size_t)
+  let (mut pc32, buffer) = if s.is_null() {
+    (0, [0u8; 1].as_slice())
   } else {
-    (pc32, s, n)
+    unsafe { (*pc32, core::slice::from_raw_parts(s as *const u8, n)) }
   };
 
-  let l: ssize_t = mbtoc32(pc32, s, n, ps);
-  if l >= 0 && unsafe { *pc32 == '\0' as char32_t } {
+  let l: ssize_t = mbtoc32(&mut pc32, buffer, ps);
+  if l >= 0 && pc32 == '\0' as char32_t {
     return 0;
   }
   l as size_t
@@ -260,42 +257,48 @@ pub extern "C" fn rs_mbrtoc32(
 // BOILERPLATE
 fn c32tomb(
   s: *mut c_char,
-  c32: char32_t,
-  ps: &mut MBState
+  c32: char32_t
 ) -> ssize_t {
-  if s.is_null() {
-    return 0;
-  }
-
-  // Convert char32_t to Rust char
-  let rust_char = match char::from_u32(c32) {
-    | Some(c) => c,
-    | None => return -1 // Invalid Unicode code point
-  };
-
-  // Convert to UTF-8 bytes
-  let mut utf8_buf = [0u8; 4];
-  let utf8_str = rust_char.encode_utf8(&mut utf8_buf);
-  let utf8_bytes = utf8_str.as_bytes();
-
-  // Copy UTF-8 bytes to output buffer
+  let mut s = s;
   unsafe {
-    for (i, &byte) in utf8_bytes.iter().enumerate() {
-      *s.add(i) = byte as c_char;
+    if c32 <= 0x7f {
+      *s = c32 as c_char;
+      return 1;
+    } else if c32 <= 0x7ff {
+      *s = 0xc0u8 as c_char | (c32.wrapping_shr(6)) as c_char;
+      s = s.wrapping_offset(1);
+      *s = 0x80u8 as c_char | (c32 & 0x3f) as c_char;
+      return 2;
+    } else if c32 <= 0xffff {
+      if c32 >= 0xd800 && c32 <= 0xdfff {
+        //errno::set_errno(errno::EILSEQ);
+        return -1;
+      }
+      *s = 0xe0u8 as c_char | (c32.wrapping_shr(12)) as c_char;
+      s = s.wrapping_offset(1);
+      *s = 0x80u8 as c_char | ((c32.wrapping_shr(6)) & 0x3f) as c_char;
+      s = s.wrapping_offset(1);
+      *s = 0x80u8 as c_char | (c32 & 0x3f) as c_char;
+      return 3;
+    } else if c32 <= 0x10ffff {
+      *s = 0xf0u8 as c_char | (c32.wrapping_shr(18)) as c_char;
+      s = s.wrapping_offset(1);
+      *s = 0x80u8 as c_char | ((c32.wrapping_shr(12)) & 0x3f) as c_char;
+      s = s.wrapping_offset(1);
+      *s = 0x80u8 as c_char | ((c32.wrapping_shr(6)) & 0x3f) as c_char;
+      s = s.wrapping_offset(1);
+      *s = 0x80u8 as c_char | (c32 & 0x3f) as c_char;
+      return 4;
+    } else {
+      //errno::set_errno(errno::EILSEQ);
+      return -1;
     }
   }
-
-  // Reset state after successful conversion
-  ps.count = 0;
-  ps.u8_buffer = [0; 4];
-
-  utf8_bytes.len() as ssize_t
 }
 
 fn mbtoc32(
-  _pc32: *mut char32_t,
-  _s: *const c_char,
-  _n: size_t,
+  _pc32: &mut char32_t,
+  _s: &[u8],
   _ps: &mut MBState
 ) -> ssize_t {
   todo!()
